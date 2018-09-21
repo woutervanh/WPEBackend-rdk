@@ -128,6 +128,7 @@ struct wpe_renderer_backend_egl_target_interface viv_imx6_renderer_backend_egl_t
         auto& target = *static_cast<VIVimx6::EGLTarget*>(data);
         target.eglNativeDisplay =  fbGetDisplayByIndex(0);
         target.eglNativeWindow = fbCreateWindow(target.eglNativeDisplay, 0, 0, target.width, target.height);
+        eglSwapInterval(target.eglNativeDisplay, 0);
         return target.eglNativeWindow;
     },
     // resize
