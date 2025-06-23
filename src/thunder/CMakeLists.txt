@@ -6,6 +6,7 @@ find_package(ClientCompositor REQUIRED)
 message(STATUS "Building with compositor client")
 list(APPEND WPE_PLATFORM_LIBRARIES
     ClientCompositor::ClientCompositor
+    EGL::EGL
 )
 
 if (WAYLAND_FOUND AND WAYLAND_EGL_FOUND AND WPE_VERSION VERSION_GREATER 1.4)
@@ -41,7 +42,7 @@ add_definitions(-DBACKEND_THUNDER=1)
 add_definitions(-DEGL_EGLEXT_PROTOTYPES=1)
 
 list(APPEND WPE_PLATFORM_SOURCES
-    src/thunder/renderer-backend.cpp
+    src/thunder/renderer-backend-egl.cpp
     src/thunder/view-backend.cpp
-    src/thunder/display.cpp
+    src/thunder/input.cpp
 )

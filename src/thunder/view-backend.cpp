@@ -26,214 +26,130 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include <wpe/wpe.h>
-#include "display.h"
-#include "ipc.h"
+#include "input.h"
 #include "ipc-buffer.h"
+#include "ipc.h"
 #include <array>
-
-#define __RPI_BACKEND_VSYNC__ 1
-
-#ifdef __RPI_BACKEND_VSYNC__
-#include "bcm_host.h"
-#endif
-
-#define WIDTH 1280
-#define HEIGHT 720
+#include <wpe/wpe.h>
 
 namespace Thunder {
 
-struct ViewBackend : public IPC::Host::Handler {
-    ViewBackend(struct wpe_view_backend*);
-    virtual ~ViewBackend();
+constexpr uint16_t DefaultWidth(1280);
+constexpr uint16_t DefaultHeight(720);
+
+class ViewBackend : public IPC::Host::Handler {
+public:
+    ViewBackend() = delete;
+    ViewBackend(const ViewBackend&) = delete;
+    ViewBackend& operator=(const ViewBackend&) = delete;
+    ViewBackend& operator=(ViewBackend&&) = delete;
+
+    ViewBackend(struct wpe_view_backend* backend)
+        : _backend(backend)
+        , _touchPoints()
+        , _ipcHost()
+    {
+        _ipcHost.initialize(*this);
+
+        _touchPoints.fill({ wpe_input_touch_event_type_null, 0, 0, 0, 0 });
+    }
+
+    virtual ~ViewBackend()
+    {
+        _ipcHost.deinitialize();
+    }
+
+    void Initialize()
+    {
+        uint16_t height = DefaultHeight;
+        uint16_t width = DefaultWidth;
+
+        const char* width_text = ::getenv("WEBKIT_RESOLUTION_WIDTH");
+        const char* height_text = ::getenv("WEBKIT_RESOLUTION_HEIGHT");
+
+        if (width_text != nullptr) {
+            width = ::atoi(width_text);
+        }
+        if (height_text != nullptr) {
+            height = ::atoi(height_text);
+        }
+
+        wpe_view_backend_dispatch_set_size(_backend, width, height);
+    }
+
+    int ClientFD()
+    {
+        return _ipcHost.releaseClientFD();
+    }
 
     // IPC::Host::Handler
     void handleFd(int) override { };
-    void handleMessage(char*, size_t) override;
+    void handleMessage(char* data, size_t size) override
+    {
+        if (size != IPC::Message::size)
+            return;
 
-    void initialize();
-
-    static gboolean vsyncCallback(gpointer);
-
-    struct wpe_view_backend* backend;
-    std::array<struct wpe_input_touch_event_raw, 10> touchpoints;
-    IPC::Host ipcHost;
-    GSource* vsyncSource;
-    bool triggered;
-
-    #ifdef __RPI_BACKEND_VSYNC__
-    DISPMANX_DISPLAY_HANDLE_T displayHandle;
-    #endif
-};
-
-#ifdef __RPI_BACKEND_VSYNC__
-static void VSyncCallback(DISPMANX_UPDATE_HANDLE_T update, void* userData);
-#endif
-
-static GSource* MaxFPS() {
-    uint32_t tickDelay = 10; // 100 frames per second should be MAX and the default.
-    const char* max_FPS = ::getenv("WEBKIT_MAXIMUM_FPS");
-
-    if (max_FPS != nullptr) {
-        uint32_t configValue = ::atoi(max_FPS);
-        if ((configValue >= 1) && (configValue <= 100)) {
-            tickDelay = (1000 / configValue);
-
+        auto& message = IPC::Message::cast(data);
+        switch (message.messageCode) {
+        case Input::MsgType::AXIS: {
+            struct wpe_input_axis_event* event = reinterpret_cast<wpe_input_axis_event*>(std::addressof(message.messageData));
+            wpe_view_backend_dispatch_axis_event(_backend, event);
+            break;
         }
-        if (configValue == 0) {
-            tickDelay = 0;
+        case Input::MsgType::POINTER: {
+            struct wpe_input_pointer_event* event = reinterpret_cast<wpe_input_pointer_event*>(std::addressof(message.messageData));
+            wpe_view_backend_dispatch_pointer_event(_backend, event);
+            break;
         }
-    }
-   
-    return (tickDelay > 0 ? g_timeout_source_new(tickDelay) : nullptr);
-}
+        case Input::MsgType::TOUCH: // UNUSED!
+        {
+            struct wpe_input_touch_event* event = reinterpret_cast<wpe_input_touch_event*>(std::addressof(message.messageData));
+            wpe_view_backend_dispatch_touch_event(_backend, event);
+            break;
+        }
+        case Input::MsgType::TOUCHSIMPLE: {
+            struct wpe_input_touch_event_raw* tp = reinterpret_cast<wpe_input_touch_event_raw*>(std::addressof(message.messageData));
+            if ((tp->id >= 0) && (tp->id < static_cast<int32_t>(_touchPoints.size()))) {
+                auto& point = _touchPoints[tp->id];
+                point = { tp->type, tp->time, tp->id, tp->x, tp->y };
 
-ViewBackend::ViewBackend(struct wpe_view_backend* backend)
-    : backend(backend)
-    , vsyncSource(MaxFPS())
-    , triggered(false)
-    #ifdef __RPI_BACKEND_VSYNC__
-    , displayHandle(NULL)
-    #endif
-{
-    ipcHost.initialize(*this);
+                struct wpe_input_touch_event event = { _touchPoints.data(), _touchPoints.size(), tp->type, tp->id, tp->time, 0 };
+                wpe_view_backend_dispatch_touch_event(_backend, &event);
 
-    if (vsyncSource != nullptr) {
-        g_source_set_callback(vsyncSource, static_cast<GSourceFunc>(vsyncCallback), this, nullptr);
-        g_source_set_priority(vsyncSource, G_PRIORITY_HIGH + 30);
-        g_source_set_can_recurse(vsyncSource, TRUE);
-        g_source_attach(vsyncSource, g_main_context_get_thread_default());
-    }
-
-    touchpoints.fill({ wpe_input_touch_event_type_null, 0, 0, 0, 0 });
-}
-
-ViewBackend::~ViewBackend()
-{
-    if (vsyncSource != nullptr) {
-        g_source_destroy(vsyncSource);
-    }
-    #ifdef __RPI_BACKEND_VSYNC__
-    else if (displayHandle != NULL) {
-        vc_dispmanx_display_close(displayHandle);
-    }
-    #endif
-    ipcHost.deinitialize();
-}
-
-void ViewBackend::handleMessage(char* data, size_t size)
-{
-    if (size != IPC::Message::size)
-        return;
-
-    auto& message = IPC::Message::cast(data);
-    switch (message.messageCode) {
-    case Display::MsgType::AXIS:
-    {
-        struct wpe_input_axis_event * event = reinterpret_cast<wpe_input_axis_event*>(std::addressof(message.messageData));
-        wpe_view_backend_dispatch_axis_event(backend, event);
-        break;
-    }
-    case Display::MsgType::POINTER:
-    {
-        struct wpe_input_pointer_event * event = reinterpret_cast<wpe_input_pointer_event*>(std::addressof(message.messageData));
-        wpe_view_backend_dispatch_pointer_event(backend, event);
-        break;
-    }
-    case Display::MsgType::TOUCH: // UNUSED!
-    {
-        struct wpe_input_touch_event * event = reinterpret_cast<wpe_input_touch_event*>(std::addressof(message.messageData));
-        wpe_view_backend_dispatch_touch_event(backend, event);
-        break;
-    }
-    case Display::MsgType::TOUCHSIMPLE:
-    {
-        struct wpe_input_touch_event_raw * tp = reinterpret_cast<wpe_input_touch_event_raw*>(std::addressof(message.messageData));
-        if ((tp->id >= 0) && (tp->id < static_cast<int32_t>(touchpoints.size()))) {
-            auto& point = touchpoints[tp->id];
-            point = { tp->type, tp->time, tp->id, tp->x, tp->y };
-
-            struct wpe_input_touch_event event = { touchpoints.data(), touchpoints.size(), tp->type, tp->id, tp->time, 0 };
-            wpe_view_backend_dispatch_touch_event(backend, &event);
-
-            // Free the slot if the touch disappears.
-            if (tp->type == wpe_input_touch_event_type_up) {
-                point = { wpe_input_touch_event_type_null, 0, -1, -1, -1 };
+                // Free the slot if the touch disappears.
+                if (tp->type == wpe_input_touch_event_type_up) {
+                    point = { wpe_input_touch_event_type_null, 0, -1, -1, -1 };
+                }
             }
+            break;
         }
-        break;
-    }
-    case Display::MsgType::KEYBOARD:
-    {
-        struct wpe_input_keyboard_event * event = reinterpret_cast<wpe_input_keyboard_event*>(std::addressof(message.messageData));
-        wpe_view_backend_dispatch_keyboard_event(backend, event);
-        break;
-    }
-    case IPC::AdjustedDimensions::code:
-    {
-        IPC::AdjustedDimensions dimensions = IPC::AdjustedDimensions::cast(message);
+        case Input::MsgType::KEYBOARD: {
+            struct wpe_input_keyboard_event* event = reinterpret_cast<wpe_input_keyboard_event*>(std::addressof(message.messageData));
+            wpe_view_backend_dispatch_keyboard_event(_backend, event);
+            break;
+        }
+        case IPC::BufferCommit::code: {
+            wpe_view_backend_dispatch_frame_displayed(_backend); // Just inform the plugin that we rendered a frame...
+            break;
+        }
+        case IPC::AdjustedDimensions::code: {
+            IPC::AdjustedDimensions dimensions = IPC::AdjustedDimensions::cast(message);
 
-        wpe_view_backend_dispatch_set_size(backend, dimensions.width, dimensions.height);
+            wpe_view_backend_dispatch_set_size(_backend, dimensions.width, dimensions.height);
 
-        fprintf(stdout,"Adjusted (internal buffer) dimensions to %u x %u\n", dimensions.width, dimensions.height);
-        break;
-    }
-    case IPC::BufferCommit::code:
-    {
-        triggered = true;
-        break;
-    }
-    default:
-        fprintf(stderr, "ViewBackend: unhandled message\n");
-    }
-}
-
-void ViewBackend::initialize()
-{
-    uint16_t height = HEIGHT;
-    uint16_t width = WIDTH;
-
-    const char* width_text = ::getenv("WEBKIT_RESOLUTION_WIDTH");
-    const char* height_text = ::getenv("WEBKIT_RESOLUTION_HEIGHT");
-    if (width_text != nullptr) {
-        width = ::atoi(width_text);
-    }
-    if (height_text != nullptr) {
-        height = ::atoi(height_text);
-    }
-    wpe_view_backend_dispatch_set_size( backend, width, height);
-
-    #ifdef __RPI_BACKEND_VSYNC__
-    if (vsyncSource == nullptr) {
-        displayHandle = vc_dispmanx_display_open(0);
-        vc_dispmanx_vsync_callback(displayHandle, VSyncCallback, this);
-    }
-    #endif
-}
-
-/* static */ gboolean ViewBackend::vsyncCallback(gpointer data)
-{
-    ViewBackend* impl = static_cast<ViewBackend*>(data);
-
-    if (impl->triggered) {
-        impl->triggered = false;
-        IPC::Message message;
-        IPC::FrameComplete::construct(message);
-        impl->ipcHost.sendMessage(IPC::Message::data(message), IPC::Message::size);
-
-        wpe_view_backend_dispatch_frame_displayed(impl->backend);
+            fprintf(stdout, "Adjusted (internal buffer) dimensions to %u x %u\n", dimensions.width, dimensions.height);
+            break;
+        }
+        default:
+            fprintf(stderr, "ViewBackend: unhandled message\n");
+        }
     }
 
-    return (G_SOURCE_CONTINUE);
-}
-
-#ifdef __RPI_BACKEND_VSYNC__
-static void VSyncCallback(DISPMANX_UPDATE_HANDLE_T update, void* userData)
-{
-    ViewBackend::vsyncCallback((gpointer) userData);
-} 
-#endif
-
+private:
+    struct wpe_view_backend* _backend;
+    std::array<struct wpe_input_touch_event_raw, 10> _touchPoints;
+    IPC::Host _ipcHost;
+};
 
 } // namespace Thunder
 
@@ -241,28 +157,23 @@ extern "C" {
 
 struct wpe_view_backend_interface thunder_view_backend_interface = {
     // create
-    [](void*, struct wpe_view_backend* backend) -> void*
-    {
+    [](void*, struct wpe_view_backend* backend) -> void* {
         return new Thunder::ViewBackend(backend);
     },
     // destroy
-    [](void* data)
-    {
+    [](void* data) {
         Thunder::ViewBackend* backend = static_cast<Thunder::ViewBackend*>(data);
         delete backend;
     },
     // initialize
-    [](void* data)
-    {
-        Thunder::ViewBackend& backend (*static_cast<Thunder::ViewBackend*>(data));
-        backend.initialize();
+    [](void* data) {
+        Thunder::ViewBackend& backend(*static_cast<Thunder::ViewBackend*>(data));
+        backend.Initialize();
     },
     // get_renderer_host_fd
-    [](void* data) -> int
-    {
-        Thunder::ViewBackend& backend (*static_cast<Thunder::ViewBackend*>(data));
-        return backend.ipcHost.releaseClientFD();
+    [](void* data) -> int {
+        Thunder::ViewBackend& backend(*static_cast<Thunder::ViewBackend*>(data));
+        return backend.ClientFD();
     },
 };
-
 }
